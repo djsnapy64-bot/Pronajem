@@ -18,8 +18,17 @@ Tento projekt automaticky monitoruje úřední desky a nabídky pronájmů měst
    - typ řízení (`auction_or_fixed`, např. výběrové řízení obálkovou metodou nebo licitace)
    - stručné shrnutí podmínek a termínů prohlídek
 4. **Filtrování:** Ověří, zda nabídka odpovídá vašim požadavkům (např. min. dispozice 2+kk, nájem do 15 000 Kč).
-5. **Notifikace na Telegram:** Pokud byt projde filtrem, obdržíte přehlednou zprávu s přímým odkazem na detail nabídky i PDF.
+5. **Push notifikace přes ntfy (iOS / Android):** Pokud byt projde filtrem, obdržíte push notifikaci přímo do aplikace ntfy s akčními tlačítky na web nabídky i stažení PDF.
 6. **Deduplikace v SQLite:** Zpracované záznamy se ukládají do lokální databáze `seen_items.db`, aby vám nechodily duplicitní zprávy.
+
+---
+
+## 📱 Jak nastavit ntfy na iOS
+
+1. V **App Store** na vašem iPhonu si nainstalujte bezplatnou aplikaci **ntfy**.
+2. Otevřete aplikaci a klikněte na tlačítko **`+`** (přidat odběr tématu).
+3. Zadejte název vašeho tématu (např. `ostrava-byty-muj-kanal-789`), které nastavíte i do proměnné `NTFY_TOPIC`.
+4. Povolte notifikace. To je vše! Od této chvíle vám budou chodit okamžitá push oznámení s tlačítky pro zobrazení webu i PDF.
 
 ---
 
@@ -48,8 +57,10 @@ Obsah `.env`:
 GEMINI_API_KEY=AIzaSy...
 GEMINI_MODEL=gemini-2.5-flash
 
-TELEGRAM_BOT_TOKEN=123456789:ABC...
-TELEGRAM_CHAT_ID=123456789
+# ntfy téma (zvolte unikátní název)
+NTFY_TOPIC=ostrava-byty-muj-kanal-789
+NTFY_SERVER_URL=https://ntfy.sh
+NTFY_ACCESS_TOKEN=
 
 # Filtry
 FILTER_ALLOWED_DISPOSITIONS=2+1,2+kk,3+1,3+kk,4+1,4+kk
@@ -59,10 +70,8 @@ SCRAPE_DISTRICTS=moap,poruba
 DB_PATH=seen_items.db
 ```
 
-### 3. Získání potřebných klíčů:
+### 3. Získání Gemini API klíče:
 - **Google Gemini API Key:** Zdarma získáte na [Google AI Studio](https://aistudio.google.com/).
-- **Telegram Bot Token:** Napište uživateli `@BotFather` na Telegramu a vytvořte nového bota příkazem `/newbot`.
-- **Telegram Chat ID:** Napište botovi `@userinfobot` nebo pošlete zprávu svému novému botovi a zjistěte své ID přes `https://api.telegram.org/bot<TOKEN>/getUpdates`.
 
 ### 4. Spuštění
 ```bash
@@ -76,12 +85,11 @@ python main.py
 V repozitáři je připraven workflow soubor `.github/workflows/checker.yml`, který skript spouští **každý den v 7:00 UTC**.
 
 ### Jak nastavit GitHub:
-1. Nahrajte tento adresář do svého (soukromého či veřejného) GitHub repozitáře.
+1. Nahrajte tento adresář do svého GitHub repozitáře.
 2. V repozitáři přejděte do **Settings -> Secrets and variables -> Actions**.
 3. V záložce **Secrets** klikněte na **New repository secret** a přidejte:
    - `GEMINI_API_KEY`
-   - `TELEGRAM_BOT_TOKEN`
-   - `TELEGRAM_CHAT_ID`
+   - `NTFY_TOPIC` (nebo v záložce Variables)
 4. V **Settings -> Actions -> General -> Workflow permissions** zaškrtněte volbu:
    - **Read and write permissions** (aby GitHub Actions mohl uložit `seen_items.db` zpět do repozitáře a pamatovat si, co už bylo odesláno).
 5. V záložce **Actions** můžete workflow kdykoliv spustit ručně tlačítkem **Run workflow**.

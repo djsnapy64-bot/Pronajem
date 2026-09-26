@@ -3,7 +3,7 @@
 Městské Byty Ostrava - Automatický hlídač nových nabídek pronájmů městských bytů
 Sleduje úřední desky a portály obvodů Moravská Ostrava a Přívoz (MOaP) a Ostrava-Poruba.
 Stahuje přiložená PDF, pomocí Google Gemini LLM extrahuje strukturovaná data,
-aplikuje filtry a posílá notifikace přes Telegram Bot API s deduplikací v SQLite.
+aplikuje filtry a posílá notifikace přes ntfy (iOS / Android / Web) s deduplikací v SQLite.
 """
 
 import os
@@ -43,8 +43,9 @@ class Config:
     GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "").strip()
     GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
 
-    TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    NTFY_TOPIC: str = os.getenv("NTFY_TOPIC", "").strip()
+    NTFY_SERVER_URL: str = os.getenv("NTFY_SERVER_URL", "https://ntfy.sh").strip().rstrip("/")
+    NTFY_ACCESS_TOKEN: str = os.getenv("NTFY_ACCESS_TOKEN", "").strip()
 
     DB_PATH: str = os.getenv("DB_PATH", "seen_items.db").strip()
 
@@ -70,14 +71,12 @@ class Config:
         missing = []
         if not cls.GEMINI_API_KEY:
             missing.append("GEMINI_API_KEY")
-        if not cls.TELEGRAM_BOT_TOKEN:
-            missing.append("TELEGRAM_BOT_TOKEN")
-        if not cls.TELEGRAM_CHAT_ID:
-            missing.append("TELEGRAM_CHAT_ID")
+        if not cls.NTFY_TOPIC:
+            missing.append("NTFY_TOPIC")
         if missing:
             logger.warning(
                 f"Upozornění: Chybí konfigurace v .env: {', '.join(missing)}. "
-                "Skript poběží v testovacím režimu bez odesílání Telegram zpráv nebo volání Gemini."
+                "Skript poběží v testovacím režimu bez odesílání ntfy notifikací nebo volání Gemini."
             )
 
 
@@ -506,53 +505,75 @@ def matches_filter(offer: ApartmentOffer, config: Config) -> Tuple[bool, str]:
     return True, "Splňuje filtr"
 
 
-# ==============================================================================
-# 8. Telegram Notifikace
-# ==============================================================================
-def send_telegram_alert(
+# ==============================================
+# 8. ntfy Notifikace (pro iOS / Android / Web)
+# ==============================================
+def send_ntfy_alert(
     candidate: RawCandidate,
     offer: ApartmentOffer,
     config: Config,
 ) -> bool:
-    """Odešle formátovanou HTML zprávu do Telegram chatu přes Bot API."""
-    if not config.TELEGRAM_BOT_TOKEN or not config.TELEGRAM_CHAT_ID:
-        logger.info("[Telegram] Notifikace neodeslána – chybí TELEGRAM_BOT_TOKEN nebo CHAT_ID.")
+    """
+    Odešle push notifikaci do aplikace ntfy (iOS / Android) přes HTTP POST JSON API.
+    Obsahuje přímá akční tlačítka pro otevření webu i stažení PDF.
+    """
+    if not config.NTFY_TOPIC:
+        logger.info("[ntfy] Notifikace neodeslána – chybí NTFY_TOPIC.")
         return False
 
-    rent_str = f"{offer.min_rent_czk:,.0f} Kč/měsíc".replace(",", " ") if offer.min_rent_czk > 0 else "Dle nabídky / neuvedeno"
-    area_str = f"{offer.floor_area_m2:.1f} m²" if offer.floor_area_m2 > 0 else "neuvedena"
-    pdf_link_str = f'<a href="{candidate.pdf_urls[0]}">Stáhnout PDF</a>' if candidate.pdf_urls else "Není přiloženo"
-
-    html_message = (
-        f"🏢 <b>Nový obecní byt k pronájmu – Ostrava</b>\n"
-        f"🏛 <b>Obvod:</b> {candidate.district}\n\n"
-        f"📍 <b>Adresa:</b> {offer.address or candidate.title}\n"
-        f"📐 <b>Dispozice:</b> <b>{offer.disposition or 'neuvedena'}</b> ({area_str})\n"
-        f"💰 <b>Minimální nájemné:</b> {rent_str}\n"
-        f"⏳ <b>Uzávěrka přihlášek:</b> <b>{offer.deadline or 'viz dokument'}</b>\n"
-        f"⚖️ <b>Typ řízení:</b> {offer.auction_or_fixed or 'výběrové řízení'}\n\n"
-        f"📝 <b>Podrobnosti:</b> {offer.summary}\n\n"
-        f"🔗 <a href=\"{candidate.url}\">Otevřít stránku nabídky</a> | 📄 {pdf_link_str}"
+    rent_str = (
+        f"{offer.min_rent_czk:,.0f} Kč/měsíc".replace(",", " ")
+        if offer.min_rent_czk > 0
+        else "Dle nabídky / neuvedeno"
     )
+    area_str = f"{offer.floor_area_m2:.1f} m²" if offer.floor_area_m2 > 0 else "neuvedena"
 
-    api_url = f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/sendMessage"
+    title = f"🏢 Nový byt {offer.disposition or ''}: {offer.address or candidate.title}".strip()
+
+    body_lines = [
+        f"🏛 Obvod: {candidate.district}",
+        f"📍 Adresa: {offer.address or candidate.title}",
+        f"📐 Dispozice: {offer.disposition or 'neuvedena'} ({area_str})",
+        f"💰 Nájemné: {rent_str}",
+        f"⏳ Uzávěrka: {offer.deadline or 'viz nabídka'}",
+        f"⚖️ Typ řízení: {offer.auction_or_fixed or 'výběrové řízení'}",
+    ]
+    if offer.summary:
+        body_lines.append(f"\n📝 {offer.summary}")
+
+    actions = []
+    if candidate.url:
+        actions.append({"action": "view", "label": "🌐 Otevřít nabídku", "url": candidate.url})
+    if candidate.pdf_urls:
+        actions.append({"action": "view", "label": "📄 Zobrazit PDF", "url": candidate.pdf_urls[0]})
+
     payload = {
-        "chat_id": config.TELEGRAM_CHAT_ID,
-        "text": html_message,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": False,
+        "topic": config.NTFY_TOPIC,
+        "title": title,
+        "message": "\n".join(body_lines),
+        "tags": ["house", "building"],
+        "priority": 4,  # vysoká priorita pro iOS upozornění
+        "click": candidate.url or (candidate.pdf_urls[0] if candidate.pdf_urls else ""),
+        "actions": actions,
     }
 
+    headers = {"Content-Type": "application/json; charset=utf-8"}
+    if config.NTFY_ACCESS_TOKEN:
+        headers["Authorization"] = f"Bearer {config.NTFY_ACCESS_TOKEN}"
+
+    url = config.NTFY_SERVER_URL
     try:
-        resp = requests.post(api_url, json=payload, timeout=config.HTTP_TIMEOUT)
+        resp = requests.post(url, json=payload, headers=headers, timeout=config.HTTP_TIMEOUT)
         if resp.status_code == 200:
-            logger.info(f"[Telegram] Notifikace úspěšně odeslána pro byt: {offer.address}")
+            logger.info(
+                f"[ntfy] Notifikace úspěšně odeslána na téma '{config.NTFY_TOPIC}' pro byt: {offer.address}"
+            )
             return True
         else:
-            logger.error(f"[Telegram] Chyba odeslání zprávy ({resp.status_code}): {resp.text}")
+            logger.error(f"[ntfy] Chyba odeslání zprávy ({resp.status_code}): {resp.text}")
             return False
     except Exception as e:
-        logger.error(f"[Telegram] Výjimka při odesílání: {e}")
+        logger.error(f"[ntfy] Výjimka při odesílání: {e}")
         return False
 
 
@@ -625,8 +646,8 @@ def main():
         notified = False
         if passed:
             passed_filter_count += 1
-            # 5. Odeslání Telegram notifikace
-            notified = send_telegram_alert(item, offer, Config)
+            # 5. Odeslání ntfy notifikace
+            notified = send_ntfy_alert(item, offer, Config)
             if notified:
                 notified_count += 1
 
