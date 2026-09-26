@@ -2,6 +2,21 @@
 
 Tento projekt automaticky monitoruje úřední desky a nabídky pronájmů městských bytů v Ostravě (aktuálně podporuje obvody **Moravská Ostrava a Přívoz** a **Ostrava-Poruba**).
 
+## 🌐 Kde vidíte webový přehled (Dashboard)
+
+Všechny nalezené byty si můžete kdykoliv prohlížet a filtrovat na interaktivní webové stránce:
+👉 **[https://djsnapy64-bot.github.io/Pronajem/](https://djsnapy64-bot.github.io/Pronajem/)**
+
+### Jak zapnout webovou stránku na GitHubu (stačí 1×):
+1. V repozitáři přejděte do **Settings ➔ Pages** (v levém menu).
+2. Pod **Build and deployment** (Branch) zvolte:
+   - Větev: **`main`**
+   - Složka: **`/ (root)`**
+3. Klikněte na **Save**.
+4. Do 1–2 minut máte vlastní živý dashboard na adrese: `https://djsnapy64-bot.github.io/Pronajem/`
+
+---
+
 ## 🚀 Jak systém funguje
 
 1. **Scraping webů:** Projde aktuální nabídky na webových portálech městských obvodů:

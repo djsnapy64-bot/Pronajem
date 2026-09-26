@@ -11,6 +11,7 @@ import sys
 import io
 import re
 import json
+import html
 import logging
 import sqlite3
 import datetime
@@ -146,12 +147,19 @@ class Database:
                     min_rent_czk REAL,
                     deadline TEXT,
                     auction_or_fixed TEXT,
+                    summary TEXT,
                     passed_filter INTEGER,
                     notified INTEGER,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
                 """
             )
+            # Ověříme, zda existuje sloupec summary pro případnou migraci staré db
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA table_info(seen_offers)")
+            columns = [col[1] for col in cursor.fetchall()]
+            if "summary" not in columns:
+                conn.execute("ALTER TABLE seen_offers ADD COLUMN summary TEXT DEFAULT ''")
             conn.commit()
 
     def is_seen(self, item_id: str) -> bool:
@@ -177,8 +185,8 @@ class Database:
                 INSERT OR REPLACE INTO seen_offers (
                     id, district, title, url, pdf_url,
                     address, disposition, floor_area_m2, min_rent_czk,
-                    deadline, auction_or_fixed, passed_filter, notified
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    deadline, auction_or_fixed, summary, passed_filter, notified
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     item_id,
@@ -192,11 +200,28 @@ class Database:
                     offer.min_rent_czk if offer else 0.0,
                     offer.deadline if offer else "",
                     offer.auction_or_fixed if offer else "",
+                    offer.summary if offer else "",
                     1 if passed_filter else 0,
                     1 if notified else 0,
                 ),
             )
             conn.commit()
+
+    def get_all_offers(self) -> List[dict]:
+        with self._get_connection() as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT id, district, title, url, pdf_url, address, disposition,
+                       floor_area_m2, min_rent_czk, deadline, auction_or_fixed,
+                       summary, passed_filter, notified, created_at
+                FROM seen_offers
+                WHERE (address != '' OR disposition != '' OR title != '')
+                ORDER BY created_at DESC
+                """
+            )
+            return [dict(row) for row in cursor.fetchall()]
 
 
 # ==============================================================================
@@ -246,6 +271,7 @@ class MunicipalityScraper:
 
         logger.info(f"[MOaP] Stahuji katalog nemovitostí: {catalog_url}")
         resp = self.session.get(catalog_url, timeout=self.config.HTTP_TIMEOUT)
+        resp.encoding = "utf-8"
         if resp.status_code == 200:
             soup = BeautifulSoup(resp.text, "html.parser")
             # Odkazy na byty mají tvar cz/nemovitosti/XXX-...byt...html
@@ -265,6 +291,7 @@ class MunicipalityScraper:
                 detail_resp = self.session.get(url, timeout=self.config.HTTP_TIMEOUT)
                 if detail_resp.status_code != 200:
                     continue
+                detail_resp.encoding = "utf-8"
 
                 detail_soup = BeautifulSoup(detail_resp.text, "html.parser")
                 title = detail_soup.find("h1")
@@ -541,11 +568,13 @@ def send_ntfy_alert(
     if offer.summary:
         body_lines.append(f"\n📝 {offer.summary}")
 
-    actions = []
+    actions = [
+        {"action": "view", "label": "📊 Webový přehled", "url": "https://djsnapy64-bot.github.io/Pronajem/"}
+    ]
     if candidate.url:
-        actions.append({"action": "view", "label": "🌐 Otevřít nabídku", "url": candidate.url})
+        actions.append({"action": "view", "label": "🌐 Detail nabídky", "url": candidate.url})
     if candidate.pdf_urls:
-        actions.append({"action": "view", "label": "📄 Zobrazit PDF", "url": candidate.pdf_urls[0]})
+        actions.append({"action": "view", "label": "📄 PDF záměr", "url": candidate.pdf_urls[0]})
 
     payload = {
         "topic": config.NTFY_TOPIC,
@@ -553,7 +582,7 @@ def send_ntfy_alert(
         "message": "\n".join(body_lines),
         "tags": ["house", "building"],
         "priority": 4,  # vysoká priorita pro iOS upozornění
-        "click": candidate.url or (candidate.pdf_urls[0] if candidate.pdf_urls else ""),
+        "click": "https://djsnapy64-bot.github.io/Pronajem/",
         "actions": actions,
     }
 
@@ -578,7 +607,306 @@ def send_ntfy_alert(
 
 
 # ==============================================================================
-# 9. Hlavní řídicí proces
+# 9. Záložní HTML parser (při nedostupnosti LLM)
+# ==============================================================================
+def parse_fallback_from_html(candidate: RawCandidate) -> Optional[ApartmentOffer]:
+    """Záložní extrakce údajů přímo z textu stránky pro případ nedostupnosti Gemini API klíče."""
+    text = candidate.web_text
+    title = candidate.title
+
+    # 1. Dispozice (např. 2+1, 2+kk)
+    disp_match = re.search(r'([0-9]\s*\+\s*(?:kk|[0-9]))', title, re.I)
+    if not disp_match:
+        disp_match = re.search(r'dispozice[^\w\d]*([0-9]\s*\+\s*(?:kk|[0-9]))', text, re.I)
+    disp = disp_match.group(1).replace(" ", "") if disp_match else ""
+
+    # 2. Adresa (oříznutí části "velikost 2+1...")
+    if "velikost" in title.lower():
+        address = re.split(r',\s*velikost', title, flags=re.I)[0].strip()
+    elif "byt" in title.lower():
+        address = title
+    else:
+        addr_match = re.search(r'Ulice a č\.p\./č\.o\.:\s*([^\n\r]+)', text, re.I)
+        address = addr_match.group(1).strip() if addr_match else title
+
+    # 3. Výměra (z titulku nebo z textu)
+    area = 0.0
+    area_match = re.search(r'-\s*([0-9]+(?:,[0-9]+)?)\s*m', title, re.I)
+    if not area_match:
+        area_match = re.search(r'Výměra[^\d]*([0-9]+(?:,[0-9]+)?)', text, re.I)
+    if area_match:
+        area = float(area_match.group(1).replace(",", "."))
+
+    # 4. Minimální nájemné (sazba Kč/m2 * plocha m2)
+    price_match = re.search(r'Minimální cena[^\:]*:\s*(\d+)', text, re.I)
+    rate_m2 = float(price_match.group(1)) if price_match else 0.0
+    rent = round(rate_m2 * area) if (rate_m2 > 0 and area > 0) else 0.0
+
+    # 5. Termín uzávěrky
+    deadline_match = re.search(r'Termín uzávěrky[^\d]*(\d+\.\s*\d+\.\s*\d+)', text, re.I)
+    deadline = deadline_match.group(1).strip() if deadline_match else ""
+
+    if disp or "byt" in title.lower() or address:
+        return ApartmentOffer(
+            is_apartment_offer=True,
+            address=address or title,
+            disposition=disp,
+            floor_area_m2=area,
+            min_rent_czk=rent,
+            deadline=deadline,
+            auction_or_fixed="výběrové řízení",
+            summary=title,
+        )
+    return None
+
+
+# ==============================================================================
+# 10. Generátor webového přehledu (HTML Dashboard pro GitHub Pages)
+# ==============================================================================
+def generate_html_dashboard(db: Database, output_path: str = "index.html"):
+    """
+    Vygeneruje moderní, responzivní přehled nabídek do souboru index.html.
+    Přehled lze přímo otevřít v prohlížeči nebo publikovat přes GitHub Pages.
+    """
+    offers = db.get_all_offers()
+    now_str = datetime.datetime.now().strftime("%d. %m. %Y v %H:%M")
+    total_count = len(offers)
+    passed_count = sum(1 for o in offers if o.get("passed_filter") == 1)
+
+    cards_html = []
+    for o in offers:
+        addr = o.get("address") or o.get("title") or "Neznámá adresa"
+        disp = o.get("disposition") or ""
+        district = o.get("district") or ""
+        rent = float(o.get("min_rent_czk") or 0.0)
+        area = float(o.get("floor_area_m2") or 0.0)
+        deadline = o.get("deadline") or ""
+        auction = o.get("auction_or_fixed") or "výběrové řízení"
+        summary = o.get("summary") or ""
+        url = o.get("url") or ""
+        pdf_url = o.get("pdf_url") or ""
+        passed = o.get("passed_filter") == 1
+        created_at = o.get("created_at") or ""
+
+        rent_formatted = f"{rent:,.0f} Kč / měs.".replace(",", " ") if rent > 0 else "Dle nabídky"
+        area_formatted = f"{area:.1f} m²" if area > 0 else "neuvedeno"
+        search_blob = f"{addr} {disp} {district} {summary} {auction}".lower()
+
+        card = f"""
+        <div class="card" 
+             data-district="{html.escape(district)}" 
+             data-disp="{html.escape(disp.lower().replace(' ', ''))}" 
+             data-rent="{rent}" 
+             data-area="{area}" 
+             data-passed="{'1' if passed else '0'}" 
+             data-search="{html.escape(search_blob)}">
+            <div class="card-top">
+                <div class="badge-group">
+                    <span class="badge badge-district">{html.escape(district)}</span>
+                    {f'<span class="badge badge-disp">{html.escape(disp)}</span>' if disp else ''}
+                    {f'<span class="badge badge-match">⭐ Splňuje filtr</span>' if passed else '<span class="badge badge-neutral">Mimo filtr</span>'}
+                </div>
+                <div class="card-rent">{rent_formatted}</div>
+            </div>
+            <h3 class="card-title">{html.escape(addr)}</h3>
+            <div class="specs-grid">
+                <div class="spec-box"><span class="spec-label">📐 Výměra</span><span class="spec-val">{area_formatted}</span></div>
+                <div class="spec-box"><span class="spec-label">⏳ Uzávěrka</span><span class="spec-val">{html.escape(deadline or 'viz web')}</span></div>
+                <div class="spec-box"><span class="spec-label">⚖️ Řízení</span><span class="spec-val">{html.escape(auction)}</span></div>
+            </div>
+            {f'<p class="card-desc">{html.escape(summary)}</p>' if summary else ''}
+            <div class="card-btns">
+                {f'<a href="{html.escape(url)}" target="_blank" rel="noopener noreferrer" class="btn btn-primary">🌐 Přejít na nabídku</a>' if url else ''}
+                {f'<a href="{html.escape(pdf_url)}" target="_blank" rel="noopener noreferrer" class="btn btn-secondary">📄 Stáhnout PDF</a>' if pdf_url else ''}
+            </div>
+            <div class="card-footer">Zjištěno: {html.escape(created_at[:16])}</div>
+        </div>
+        """
+        cards_html.append(card)
+
+    cards_block = "\n".join(cards_html) if cards_html else '<div class="empty-state">Zatím nebyly uloženy žádné byty. Spusťte kontrolu v GitHub Actions.</div>'
+
+    html_content = f"""<!DOCTYPE html>
+<html lang="cs">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>🏢 Městské Byty Ostrava – Přehled volných pronájmů</title>
+  <style>
+    :root {{
+      --bg: #0f172a;
+      --card-bg: #1e293b;
+      --card-border: #334155;
+      --text: #f8fafc;
+      --text-muted: #94a3b8;
+      --primary: #38bdf8;
+      --primary-hover: #0284c7;
+      --accent-green: #10b981;
+      --accent-amber: #f59e0b;
+      --accent-blue: #6366f1;
+    }}
+    * {{ box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }}
+    body {{ background: var(--bg); color: var(--text); padding: 1.5rem 1rem; min-height: 100vh; }}
+    .container {{ max-width: 1200px; margin: 0 auto; }}
+    header {{ margin-bottom: 2rem; text-align: center; }}
+    h1 {{ font-size: 2rem; font-weight: 800; margin-bottom: 0.5rem; }}
+    p.subtitle {{ color: var(--text-muted); font-size: 1rem; }}
+    
+    /* Stats Bar */
+    .stats-bar {{ display: flex; flex-wrap: wrap; justify-content: center; gap: 1rem; margin: 1.5rem 0; }}
+    .stat-pill {{ background: var(--card-bg); border: 1px solid var(--card-border); padding: 0.6rem 1.2rem; border-radius: 9999px; font-size: 0.9rem; }}
+    .stat-pill strong {{ color: var(--primary); }}
+
+    /* Filters Box */
+    .filter-panel {{ background: var(--card-bg); border: 1px solid var(--card-border); border-radius: 1rem; padding: 1.25rem; margin-bottom: 2rem; }}
+    .search-input {{ width: 100%; padding: 0.75rem 1rem; border-radius: 0.5rem; border: 1px solid var(--card-border); background: #0f172a; color: #fff; font-size: 1rem; margin-bottom: 1rem; }}
+    .search-input:focus {{ outline: 2px solid var(--primary); }}
+    .filter-row {{ display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: center; justify-content: space-between; }}
+    .filter-controls {{ display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: center; }}
+    select {{ padding: 0.6rem 1rem; border-radius: 0.5rem; border: 1px solid var(--card-border); background: #0f172a; color: #fff; font-size: 0.9rem; cursor: pointer; }}
+    .checkbox-label {{ display: flex; align-items: center; gap: 0.5rem; font-size: 0.9rem; cursor: pointer; color: var(--text); user-select: none; }}
+    .checkbox-label input {{ width: 1.1rem; height: 1.1rem; accent-color: var(--primary); cursor: pointer; }}
+
+    /* Cards Grid */
+    .grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 1.5rem; }}
+    .card {{ background: var(--card-bg); border: 1px solid var(--card-border); border-radius: 1rem; padding: 1.25rem; display: flex; flex-direction: column; transition: transform 0.15s ease, border-color 0.15s ease; }}
+    .card:hover {{ transform: translateY(-3px); border-color: var(--primary); }}
+    .card-top {{ display: flex; justify-content: space-between; align-items: flex-start; gap: 0.5rem; margin-bottom: 0.75rem; }}
+    .badge-group {{ display: flex; flex-wrap: wrap; gap: 0.4rem; }}
+    .badge {{ font-size: 0.75rem; font-weight: 700; padding: 0.25rem 0.6rem; border-radius: 9999px; text-transform: uppercase; letter-spacing: 0.05em; }}
+    .badge-district {{ background: rgba(99, 102, 241, 0.2); color: #818cf8; border: 1px solid rgba(99, 102, 241, 0.3); }}
+    .badge-disp {{ background: rgba(56, 189, 248, 0.2); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.3); }}
+    .badge-match {{ background: rgba(16, 185, 129, 0.2); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.3); }}
+    .badge-neutral {{ background: rgba(148, 163, 184, 0.15); color: #94a3b8; border: 1px solid rgba(148, 163, 184, 0.2); }}
+    .card-rent {{ font-size: 1.2rem; font-weight: 800; color: #38bdf8; text-align: right; white-space: nowrap; }}
+    .card-title {{ font-size: 1.2rem; font-weight: 700; line-height: 1.3; margin-bottom: 1rem; color: #fff; }}
+    .specs-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem; background: #0f172a; padding: 0.75rem; border-radius: 0.5rem; margin-bottom: 1rem; font-size: 0.85rem; }}
+    .spec-box {{ display: flex; flex-direction: column; }}
+    .spec-label {{ color: var(--text-muted); font-size: 0.75rem; }}
+    .spec-val {{ font-weight: 600; color: #fff; margin-top: 0.1rem; }}
+    .card-desc {{ font-size: 0.88rem; color: var(--text-muted); margin-bottom: 1.25rem; flex-grow: 1; line-height: 1.4; }}
+    .card-btns {{ display: flex; gap: 0.5rem; margin-top: auto; }}
+    .btn {{ flex: 1; text-align: center; text-decoration: none; padding: 0.65rem 0.5rem; font-size: 0.85rem; font-weight: 600; border-radius: 0.5rem; transition: background 0.15s ease; }}
+    .btn-primary {{ background: var(--primary); color: #0f172a; }}
+    .btn-primary:hover {{ background: var(--primary-hover); }}
+    .btn-secondary {{ background: #334155; color: #fff; }}
+    .btn-secondary:hover {{ background: #475569; }}
+    .card-footer {{ font-size: 0.75rem; color: #64748b; margin-top: 0.75rem; text-align: right; }}
+    .empty-state {{ grid-column: 1 / -1; text-align: center; padding: 3rem; color: var(--text-muted); font-size: 1.1rem; background: var(--card-bg); border-radius: 1rem; }}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>🏢 Městské Byty Ostrava</h1>
+      <p class="subtitle">Automatický monitoring nabídek pronájmů (Moravská Ostrava a Přívoz, Ostrava-Poruba)</p>
+      
+      <div class="stats-bar">
+        <div class="stat-pill">Celkem nabídek: <strong>{total_count}</strong></div>
+        <div class="stat-pill">Vyhovuje filtru: <strong style="color: var(--accent-green);">{passed_count}</strong></div>
+        <div class="stat-pill">Aktualizováno: <strong>{now_str}</strong></div>
+      </div>
+    </header>
+
+    <div class="filter-panel">
+      <input type="text" id="search-input" class="search-input" placeholder="🔍 Rychlé hledání podle adresy, ulice, dispozice (např. Fügnerova, 2+1)...">
+      
+      <div class="filter-row">
+        <div class="filter-controls">
+          <select id="district-filter">
+            <option value="">Všechny obvody</option>
+            <option value="Moravská Ostrava a Přívoz">Moravská Ostrava a Přívoz</option>
+            <option value="Ostrava-Poruba">Ostrava-Poruba</option>
+          </select>
+
+          <select id="disp-filter">
+            <option value="">Všechny dispozice</option>
+            <option value="1+kk,1+1">1+kk / 1+1</option>
+            <option value="2+kk,2+1">2+kk / 2+1</option>
+            <option value="3+kk,3+1">3+kk / 3+1</option>
+            <option value="4+kk,4+1">4+kk / 4+1</option>
+          </select>
+
+          <select id="sort-select">
+            <option value="newest">Řadit: Nejnovější</option>
+            <option value="rent-asc">Řadit: Nejlevnější nájem</option>
+            <option value="rent-desc">Řadit: Nejdražší nájem</option>
+            <option value="area-desc">Řadit: Největší plocha</option>
+          </select>
+        </div>
+
+        <label class="checkbox-label">
+          <input type="checkbox" id="only-passed">
+          <span>Pouze vyhovující mému filtru ⭐</span>
+        </label>
+      </div>
+    </div>
+
+    <div id="cards-container" class="grid">
+      {cards_block}
+    </div>
+  </div>
+
+  <script>
+    const searchInput = document.getElementById('search-input');
+    const districtFilter = document.getElementById('district-filter');
+    const dispFilter = document.getElementById('disp-filter');
+    const sortSelect = document.getElementById('sort-select');
+    const onlyPassedCheck = document.getElementById('only-passed');
+    const container = document.getElementById('cards-container');
+    const allCards = Array.from(document.querySelectorAll('.card'));
+
+    function applyFilters() {{
+      const query = searchInput.value.trim().toLowerCase();
+      const district = districtFilter.value;
+      const allowedDisps = dispFilter.value ? dispFilter.value.split(',') : [];
+      const onlyPassed = onlyPassedCheck.checked;
+
+      let visibleCards = allCards.filter(card => {{
+        const cardSearch = card.dataset.search || '';
+        const cardDistrict = card.dataset.district || '';
+        const cardDisp = card.dataset.disp || '';
+        const cardPassed = card.dataset.passed === '1';
+
+        if (query && !cardSearch.includes(query)) return false;
+        if (district && !cardDistrict.includes(district)) return false;
+        if (allowedDisps.length > 0 && !allowedDisps.some(d => cardDisp.includes(d))) return false;
+        if (onlyPassed && !cardPassed) return false;
+        return true;
+      }});
+
+      // Řazení
+      const sortMode = sortSelect.value;
+      visibleCards.sort((a, b) => {{
+        if (sortMode === 'rent-asc') return (parseFloat(a.dataset.rent) || 999999) - (parseFloat(b.dataset.rent) || 999999);
+        if (sortMode === 'rent-desc') return (parseFloat(b.dataset.rent) || 0) - (parseFloat(a.dataset.rent) || 0);
+        if (sortMode === 'area-desc') return (parseFloat(b.dataset.area) || 0) - (parseFloat(a.dataset.area) || 0);
+        return 0; // standardně zachovat pořadí
+      }});
+
+      allCards.forEach(card => card.style.display = 'none');
+      visibleCards.forEach(card => {{
+        card.style.display = 'flex';
+        container.appendChild(card);
+      }});
+    }}
+
+    searchInput.addEventListener('input', applyFilters);
+    districtFilter.addEventListener('change', applyFilters);
+    dispFilter.addEventListener('change', applyFilters);
+    sortSelect.addEventListener('change', applyFilters);
+    onlyPassedCheck.addEventListener('change', applyFilters);
+  </script>
+</body>
+</html>
+"""
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(html_content)
+    logger.info(f"Webový přehled byl úspěšně vygenerován do: {output_path}")
+
+
+# ==============================================================================
+# 11. Hlavní řídicí proces
 # ==============================================================================
 def main():
     logger.info("=== Spouštím kontrolu nabídek městských bytů v Ostravě ===")
@@ -616,11 +944,13 @@ def main():
 
         combined_text = f"{item.title}\n\n{item.web_text}\n\n" + "\n\n".join(all_pdf_texts)
 
-        # 3. Analýza pomocí Gemini LLM
+        # 3. Analýza pomocí Gemini LLM (nebo záložní HTML parser)
         offer = parse_with_gemini(combined_text, primary_pdf_bytes, Config)
+        if not offer:
+            offer = parse_fallback_from_html(item)
 
         if not offer:
-            logger.info("Nepodařilo se získat strukturovaná data z LLM. Označuji jako viděno.")
+            logger.info("Nepodařilo se získat strukturovaná data z LLM ani z HTML. Označuji jako viděno.")
             db.mark_seen(
                 item_id=item.id,
                 district=item.district,
@@ -634,7 +964,7 @@ def main():
             continue
 
         logger.info(
-            f"Výsledek LLM: Je byt={offer.is_apartment_offer} | Adresa='{offer.address}' | "
+            f"Výsledek: Je byt={offer.is_apartment_offer} | Adresa='{offer.address}' | "
             f"Dispozice='{offer.disposition}' | Plocha={offer.floor_area_m2}m2 | "
             f"Nájem={offer.min_rent_czk:.0f} Kč | Termín='{offer.deadline}'"
         )
@@ -662,6 +992,9 @@ def main():
             passed_filter=passed,
             notified=notified,
         )
+
+    # 7. Vytvoření/aktualizace webového přehledu
+    generate_html_dashboard(db, "index.html")
 
     logger.info(
         f"\n=== Hotovo! Zpracováno nových: {processed_count}, "
