@@ -1,0 +1,19 @@
+# Citlivé konfigurační soubory s klíči
+.env
+.env.local
+*.env
+
+# Python mezipaměť a prostředí
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+venv/
+env/
+.venv/
+
+# Systémové soubory a IDE
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
